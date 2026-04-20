@@ -12,7 +12,7 @@ import {
   requireApiVersion,
   requestUrl,
 } from "obsidian";
-import { applyPatch, createTwoFilesPatch } from "diff";
+import { applyPatch, createTwoFilesPatch, parsePatch, type StructuredPatch, type StructuredPatchHunk } from "diff";
 
 interface OpenAISummarySettings {
   apiKey: string;
@@ -371,6 +371,14 @@ interface ReviewDiffModalOptions {
   onApply: () => void | Promise<void>;
 }
 
+type ReviewDiffLineKind = "addition" | "context" | "deletion" | "note";
+
+interface ReviewDiffStats {
+  additions: number;
+  deletions: number;
+  hunks: number;
+}
+
 class ReviewDiffModal extends Modal {
   private readonly diffText: string;
   private readonly file: TFile;
@@ -385,7 +393,8 @@ class ReviewDiffModal extends Modal {
 
   onOpen(): void {
     const { contentEl } = this;
-    const stats = this.countDiffStats(this.diffText);
+    const patches = parsePatch(this.diffText);
+    const stats = this.countDiffStats(patches);
 
     this.setTitle(`AI review diff: ${this.file.basename}`);
 
@@ -402,17 +411,18 @@ class ReviewDiffModal extends Modal {
     meta.style.margin = "0 0 0.75rem 0";
     meta.style.fontWeight = "600";
 
-    const diffEl = contentEl.createEl("pre");
-    diffEl.setText(this.diffText);
-    diffEl.style.margin = "0";
-    diffEl.style.padding = "0.75rem";
-    diffEl.style.maxHeight = "24rem";
+    const diffEl = contentEl.createDiv();
+    diffEl.style.maxHeight = "28rem";
     diffEl.style.overflow = "auto";
-    diffEl.style.whiteSpace = "pre-wrap";
-    diffEl.style.wordBreak = "break-word";
-    diffEl.style.background = "var(--background-secondary)";
+    diffEl.style.background = "var(--background-primary)";
     diffEl.style.border = "1px solid var(--background-modifier-border)";
     diffEl.style.borderRadius = "8px";
+
+    if (patches.length > 0) {
+      this.renderStructuredDiff(diffEl, patches);
+    } else {
+      this.renderRawDiff(diffEl);
+    }
 
     const actions = contentEl.createDiv();
     actions.style.display = "flex";
@@ -453,22 +463,164 @@ class ReviewDiffModal extends Modal {
     this.contentEl.empty();
   }
 
-  private countDiffStats(diffText: string): { additions: number; deletions: number; hunks: number } {
+  private countDiffStats(patches: StructuredPatch[]): ReviewDiffStats {
     let additions = 0;
     let deletions = 0;
     let hunks = 0;
 
-    for (const line of diffText.split("\n")) {
-      if (line.startsWith("@@")) {
-        hunks += 1;
-      } else if (line.startsWith("+") && !line.startsWith("+++")) {
-        additions += 1;
-      } else if (line.startsWith("-") && !line.startsWith("---")) {
-        deletions += 1;
+    for (const patch of patches) {
+      hunks += patch.hunks.length;
+      for (const hunk of patch.hunks) {
+        for (const line of hunk.lines) {
+          if (line.startsWith("+")) {
+            additions += 1;
+          } else if (line.startsWith("-")) {
+            deletions += 1;
+          }
+        }
       }
     }
 
     return { additions, deletions, hunks };
+  }
+
+  private renderStructuredDiff(parent: HTMLElement, patches: StructuredPatch[]): void {
+    for (const [patchIndex, patch] of patches.entries()) {
+      if (patchIndex > 0) {
+        const spacer = parent.createDiv();
+        spacer.style.height = "0.75rem";
+        spacer.style.background = "var(--background-secondary)";
+        spacer.style.borderTop = "1px solid var(--background-modifier-border)";
+        spacer.style.borderBottom = "1px solid var(--background-modifier-border)";
+      }
+
+      const header = parent.createDiv({
+        text: `${patch.oldFileName ?? this.file.path} -> ${patch.newFileName ?? this.file.path}`,
+      });
+      header.style.padding = "0.6rem 0.75rem";
+      header.style.fontFamily = "var(--font-monospace)";
+      header.style.fontSize = "12px";
+      header.style.fontWeight = "600";
+      header.style.background = "var(--background-secondary)";
+      header.style.borderBottom = "1px solid var(--background-modifier-border)";
+      header.style.wordBreak = "break-all";
+
+      for (const hunk of patch.hunks) {
+        this.renderHunk(parent, hunk);
+      }
+    }
+  }
+
+  private renderHunk(parent: HTMLElement, hunk: StructuredPatchHunk): void {
+    const hunkHeader = parent.createDiv({
+      text: `@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`,
+    });
+    hunkHeader.style.padding = "0.35rem 0.75rem";
+    hunkHeader.style.fontFamily = "var(--font-monospace)";
+    hunkHeader.style.fontSize = "12px";
+    hunkHeader.style.color = "var(--text-muted)";
+    hunkHeader.style.background = "var(--background-secondary-alt)";
+    hunkHeader.style.borderBottom = "1px solid var(--background-modifier-border)";
+
+    let oldLineNumber = hunk.oldStart;
+    let newLineNumber = hunk.newStart;
+
+    for (const rawLine of hunk.lines) {
+      if (rawLine.startsWith("\\")) {
+        this.renderDiffRow(parent, "note", null, null, "\\", rawLine.slice(1).trimStart());
+        continue;
+      }
+
+      if (rawLine.startsWith("+")) {
+        this.renderDiffRow(parent, "addition", null, newLineNumber, "+", rawLine.slice(1));
+        newLineNumber += 1;
+        continue;
+      }
+
+      if (rawLine.startsWith("-")) {
+        this.renderDiffRow(parent, "deletion", oldLineNumber, null, "-", rawLine.slice(1));
+        oldLineNumber += 1;
+        continue;
+      }
+
+      this.renderDiffRow(parent, "context", oldLineNumber, newLineNumber, " ", rawLine.slice(1));
+      oldLineNumber += 1;
+      newLineNumber += 1;
+    }
+  }
+
+  private renderDiffRow(
+    parent: HTMLElement,
+    kind: ReviewDiffLineKind,
+    oldLineNumber: number | null,
+    newLineNumber: number | null,
+    prefix: string,
+    content: string,
+  ): void {
+    const row = parent.createDiv();
+    row.style.display = "grid";
+    row.style.gridTemplateColumns = "4rem 4rem 1.5rem minmax(0, 1fr)";
+    row.style.alignItems = "start";
+    row.style.fontFamily = "var(--font-monospace)";
+    row.style.fontSize = "12px";
+    row.style.lineHeight = "1.6";
+    row.style.borderBottom = "1px solid var(--background-modifier-border-hover)";
+
+    if (kind === "addition") {
+      row.style.background = "rgba(46, 160, 67, 0.14)";
+    } else if (kind === "deletion") {
+      row.style.background = "rgba(248, 81, 73, 0.14)";
+    } else if (kind === "note") {
+      row.style.background = "var(--background-secondary)";
+    }
+
+    if (kind === "note") {
+      const note = row.createDiv({
+        text: `${prefix}${content}`,
+      });
+      note.style.gridColumn = "1 / -1";
+      note.style.padding = "0.2rem 0.75rem";
+      note.style.color = "var(--text-muted)";
+      note.style.fontStyle = "italic";
+      note.style.whiteSpace = "pre-wrap";
+      note.style.wordBreak = "break-word";
+      return;
+    }
+
+    this.renderLineNumberCell(row, oldLineNumber);
+    this.renderLineNumberCell(row, newLineNumber);
+
+    const prefixEl = row.createDiv({ text: prefix });
+    prefixEl.style.padding = "0.2rem 0";
+    prefixEl.style.textAlign = "center";
+    prefixEl.style.color = kind === "addition" ? "#1a7f37" : kind === "deletion" ? "#cf222e" : "var(--text-faint)";
+    prefixEl.style.fontWeight = "700";
+
+    const contentEl = row.createDiv({ text: content });
+    contentEl.style.padding = "0.2rem 0.75rem 0.2rem 0";
+    contentEl.style.whiteSpace = "pre-wrap";
+    contentEl.style.wordBreak = "break-word";
+  }
+
+  private renderLineNumberCell(parent: HTMLElement, lineNumber: number | null): void {
+    const cell = parent.createDiv({
+      text: lineNumber === null ? "" : String(lineNumber),
+    });
+    cell.style.padding = "0.2rem 0.5rem";
+    cell.style.textAlign = "right";
+    cell.style.color = "var(--text-faint)";
+    cell.style.userSelect = "none";
+    cell.style.borderRight = "1px solid var(--background-modifier-border-hover)";
+  }
+
+  private renderRawDiff(parent: HTMLElement): void {
+    const rawEl = parent.createEl("pre");
+    rawEl.setText(this.diffText);
+    rawEl.style.margin = "0";
+    rawEl.style.padding = "0.75rem";
+    rawEl.style.whiteSpace = "pre-wrap";
+    rawEl.style.wordBreak = "break-word";
+    rawEl.style.background = "var(--background-secondary)";
   }
 }
 
